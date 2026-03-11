@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 from math import exp
 from scipy.linalg import sqrtm
+from torchvision.models import inception_v3, Inception_V3_Weights
 
 
 
@@ -88,3 +89,41 @@ def calculate_fid(real_features, fake_features):
     fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
 
     return fid
+
+
+def load_inception_model(device='cpu'):
+
+    weights = Inception_V3_Weights.DEFAULT
+    model = inception_v3(weights=weights, transform_input=False)
+    model.fc = torch.nn.Identity()
+    model.dropout = torch.nn.Identity()
+    model.eval()
+    model.to(device)
+
+    return model
+
+
+def extract_inception_features(images, model, device='cpu', batch_size=32):
+
+    features = []
+
+    with torch.no_grad():
+        for start in range(0, images.size(0), batch_size):
+            batch = images[start:start + batch_size].to(device)
+            batch = F.interpolate(batch, size=(299, 299), mode='bilinear', align_corners=False)
+            batch = batch.clamp(0.0, 1.0)
+            feat = model(batch)
+            features.append(feat.detach().cpu().numpy())
+
+    return np.concatenate(features, axis=0)
+
+
+def fid_from_images(real_images, fake_images, model=None, device='cpu', batch_size=32):
+
+    if model is None:
+        model = load_inception_model(device=device)
+
+    real_features = extract_inception_features(real_images, model, device=device, batch_size=batch_size)
+    fake_features = extract_inception_features(fake_images, model, device=device, batch_size=batch_size)
+
+    return calculate_fid(real_features, fake_features)
