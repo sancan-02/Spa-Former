@@ -4,10 +4,14 @@ Run: python app.py
 """
 
 import os
+import random
+from random import randint
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
 from PIL import Image
 import gradio as gr
 
@@ -18,6 +22,91 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "generator.pt")
 IMG_SIZE = 256
+
+# ---------------------------------------------------------------------------
+# Mask functions (from model.ipynb) — 1 = known, 0 = hole
+# ---------------------------------------------------------------------------
+
+def random_regular_mask(img):
+    s = img.size()
+    mask = torch.ones(1, s[1], s[2])
+    n_mask = random.randint(1, 5)
+    limx = s[1] - s[1] / (n_mask + 1)
+    limy = s[2] - s[2] / (n_mask + 1)
+    for _ in range(n_mask):
+        x = random.randint(0, int(limx))
+        y = random.randint(0, int(limy))
+        range_x = x + random.randint(int(s[1] / (n_mask + 7)), int(s[1] - x))
+        range_y = y + random.randint(int(s[2] / (n_mask + 7)), int(s[2] - y))
+        mask[:, int(x):int(range_x), int(y):int(range_y)] = 0
+    return mask
+
+
+def center_mask(img):
+    size = img.size()
+    mask = torch.ones(1, size[1], size[2])
+    x, y = int(size[1] / 4), int(size[2] / 4)
+    mask[:, x:int(size[1] * 3 / 4), y:int(size[2] * 3 / 4)] = 0
+    return mask
+
+
+def random_irregular_mask(img):
+    to_tensor = transforms.Compose([transforms.ToTensor()])
+    size = img.size()
+    mask = torch.ones(1, size[1], size[2])
+    canvas = np.zeros((size[1], size[2], 1), np.uint8)
+    max_width = 20
+    for _ in range(random.randint(16, 64)):
+        mode = random.random()
+        if mode < 0.6:
+            x1, x2 = randint(1, size[1]), randint(1, size[1])
+            y1, y2 = randint(1, size[2]), randint(1, size[2])
+            cv2.line(canvas, (x1, y1), (x2, y2), (1, 1, 1), randint(4, max_width))
+        elif mode < 0.8:
+            x1, y1 = randint(1, size[1]), randint(1, size[2])
+            cv2.circle(canvas, (x1, y1), randint(4, max_width), (1, 1, 1), -1)
+        else:
+            x1, y1 = randint(1, size[1]), randint(1, size[2])
+            s1, s2 = randint(1, size[1]), randint(1, size[2])
+            a1, a2, a3 = randint(3, 180), randint(3, 180), randint(3, 180)
+            cv2.ellipse(canvas, (x1, y1), (s1, s2), a1, a2, a3, (1, 1, 1), randint(4, max_width))
+    canvas = canvas.reshape(size[2], size[1])
+    img_mask = to_tensor(Image.fromarray(canvas * 255))
+    mask[0, :, :] = img_mask < 1
+    return mask
+
+
+def random_freefrom_mask(img, mv=5, ma=4.0, ml=40, mbw=10):
+    to_tensor = transforms.Compose([transforms.ToTensor()])
+    size = img.size()
+    mask = torch.ones(1, size[1], size[2])
+    canvas = np.zeros((size[1], size[2], 1), np.uint8)
+    num_v = 12 + np.random.randint(mv)
+    for i in range(num_v):
+        start_x = np.random.randint(size[1])
+        start_y = np.random.randint(size[2])
+        for _ in range(1 + np.random.randint(5)):
+            angle = 0.01 + np.random.randint(int(ma))
+            if i % 2 == 0:
+                angle = 2 * 3.1415926 - angle
+            length = 10 + np.random.randint(ml)
+            brush_w = 10 + np.random.randint(mbw)
+            end_x = int(start_x + length * np.sin(angle))
+            end_y = int(start_y + length * np.cos(angle))
+            cv2.line(canvas, (start_y, start_x), (end_y, end_x), 1.0, brush_w)
+            start_x, start_y = end_x, end_y
+    canvas = canvas.reshape(size[2], size[1])
+    img_mask = to_tensor(Image.fromarray(canvas * 255))
+    mask[0, :, :] = img_mask < 1
+    return mask
+
+
+MASK_FNS = {
+    "Center": center_mask,
+    "Random Rectangular": random_regular_mask,
+    "Random Irregular": random_irregular_mask,
+    "Free-form Brush": random_freefrom_mask,
+}
 
 # ---------------------------------------------------------------------------
 # Model Architecture (from model.ipynb)
@@ -225,43 +314,24 @@ def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
     return Image.fromarray((arr * 255).astype(np.uint8))
 
 
-def _run_inpainting(editor_output):
+def _run_inpainting(image, mask_type):
     if G is None:
         raise gr.Error("No weights loaded. Add checkpoints/generator.pt and restart the app.")
-    if editor_output is None:
-        return None, None, None
+    if image is None:
+        raise gr.Error("Please upload an image first.")
 
-    bg: Image.Image = editor_output["background"]
-    layers: list = editor_output.get("layers", [])
-
-    # Resize original image to model input size
-    original = bg.convert("RGB").resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
-
-    # Build binary mask from drawn layers (drawn = hole to inpaint)
-    hole_mask = Image.new("L", (IMG_SIZE, IMG_SIZE), 0)  # 0 = known region
-    for layer in layers:
-        layer_rgba = layer.convert("RGBA").resize((IMG_SIZE, IMG_SIZE), Image.NEAREST)
-        alpha = layer_rgba.split()[3]  # alpha > 0 means user painted here
-        painted = alpha.point(lambda v: 255 if v > 10 else 0)
-        hole_mask = Image.composite(Image.new("L", (IMG_SIZE, IMG_SIZE), 255), hole_mask, painted)
-
-    # hole_mask: 255 = hole, 0 = known
-    # model expects mask: 1.0 = known, 0.0 = hole
-    hole_np = np.array(hole_mask).astype(np.float32) / 255.0          # 1 = hole
-    known_np = 1.0 - hole_np                                           # 1 = known
-    mask_tensor = torch.from_numpy(known_np).unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
-
+    original = image.convert("RGB").resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
     img_np = np.array(original).astype(np.float32) / 255.0
-    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)  # [1,3,H,W]
+    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
-    img_masked = img_tensor * mask_tensor
+    mask = MASK_FNS[mask_type](img_tensor.squeeze(0)).unsqueeze(0).to(device)
+    img_masked = img_tensor * mask
 
     with torch.no_grad():
-        pred = G(img_masked, mask_tensor)           # tanh output [-1, 1]
-        pred_01 = (pred + 1.0) / 2.0               # rescale to [0, 1]
-        completed = pred_01 * (1.0 - mask_tensor) + img_masked * mask_tensor  # composite
+        pred = G(img_masked, mask).clamp(0, 1)
+        completed = pred * (1.0 - mask) + img_masked * mask
 
-    return _tensor_to_pil(img_masked), _tensor_to_pil(pred_01), _tensor_to_pil(completed)
+    return _tensor_to_pil(img_masked), _tensor_to_pil(pred), _tensor_to_pil(completed)
 
 
 # ---------------------------------------------------------------------------
@@ -321,19 +391,15 @@ def build_ui():
     with gr.Blocks(theme=theme, title="Spa-Former", css=css) as demo:
 
         gr.Markdown("# Spa-Former · Inpainting", elem_id="title")
-        gr.Markdown("Upload an image, paint the region to remove, click Inpaint.", elem_id="subtitle")
+        gr.Markdown("Upload an image, choose a mask type, click Inpaint.", elem_id="subtitle")
 
         with gr.Row(equal_height=True):
             with gr.Column(scale=3):
-                editor = gr.ImageEditor(
-                    label="Input",
-                    type="pil",
-                    image_mode="RGB",
-                    brush=gr.Brush(colors=["#ffffff"], color_mode="fixed", default_size=18),
-                    transforms=[],
-                    eraser=False,
-                    sources=["upload"],
-                    height=360,
+                input_image = gr.Image(label="Input", type="pil", height=320)
+                mask_dropdown = gr.Dropdown(
+                    choices=list(MASK_FNS.keys()),
+                    value="Random Rectangular",
+                    label="Mask Type",
                 )
                 run_btn = gr.Button("Inpaint", variant="primary", size="lg", elem_id="run_btn")
 
@@ -348,7 +414,7 @@ def build_ui():
 
         run_btn.click(
             fn=_run_inpainting,
-            inputs=[editor],
+            inputs=[input_image, mask_dropdown],
             outputs=[out_masked, out_raw, out_composite],
         )
 
